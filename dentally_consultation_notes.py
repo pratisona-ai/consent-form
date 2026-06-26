@@ -147,6 +147,73 @@ def tool_get_recalls(patient_id: int) -> str:
     return json.dumps(recalls) if recalls else "No recalls on record."
 
 
+def tool_get_sms(patient_id: int) -> str:
+    sms = _dget("/sms", {"patient_id": patient_id}).get("sms", [])
+    if not sms:
+        return "No SMS messages on record."
+    return json.dumps([{
+        "id": m.get("id"),
+        "direction": m.get("direction"),
+        "body": m.get("body"),
+        "created_at": m.get("created_at"),
+        "status": m.get("status"),
+    } for m in sms])
+
+
+def tool_get_patient_documents(patient_id: int) -> str:
+    docs = _dget("/patient_documents", {"patient_id": patient_id}).get("patient_documents", [])
+    if not docs:
+        return "No documents uploaded for this patient."
+    return json.dumps([{
+        "id": d.get("id"),
+        "name": d.get("name"),
+        "description": d.get("description"),
+        "file_type": d.get("file_type"),
+        "created_at": d.get("created_at"),
+        "url": d.get("url"),
+    } for d in docs])
+
+
+def tool_get_notes(patient_id: int) -> str:
+    notes = _dget("/notes", {"patient_id": patient_id}).get("notes", [])
+    if not notes:
+        return "No notes on record."
+    return json.dumps([{
+        "id": n.get("id"),
+        "note": n.get("note"),
+        "created_at": n.get("created_at"),
+        "author": n.get("author"),
+    } for n in notes])
+
+
+def tool_get_medical_histories(patient_id: int) -> str:
+    records = _dget("/medical_histories", {"patient_id": patient_id}).get("medical_histories", [])
+    if not records:
+        return "No medical history forms completed."
+    return json.dumps([{
+        "id": r.get("id"),
+        "created_at": r.get("created_at"),
+        "answers": r.get("answers"),
+        "conditions": r.get("conditions"),
+        "medications": r.get("medications"),
+        "allergies": r.get("allergies"),
+    } for r in records])
+
+
+def tool_get_invoices(patient_id: int) -> str:
+    invoices = _dget("/invoices", {"patient_id": patient_id}).get("invoices", [])
+    if not invoices:
+        return "No invoices on record."
+    return json.dumps([{
+        "id": i.get("id"),
+        "state": i.get("state"),
+        "total": i.get("total"),
+        "balance": i.get("balance"),
+        "created_at": i.get("created_at"),
+        "description": i.get("description"),
+    } for i in invoices])
+
+
 def tool_generate_consent_form(patient_name: str, clinical_context: str) -> str:
     """Fills the FAME template using Gemini and stores the .docx in session state."""
     today  = datetime.date.today().strftime("%d %B %Y")
@@ -194,6 +261,11 @@ TOOL_FN_MAP = {
     "get_treatment_plans":      tool_get_treatment_plans,
     "get_treatment_plan_items": tool_get_treatment_plan_items,
     "get_recalls":              tool_get_recalls,
+    "get_sms":                  tool_get_sms,
+    "get_patient_documents":    tool_get_patient_documents,
+    "get_notes":                tool_get_notes,
+    "get_medical_histories":    tool_get_medical_histories,
+    "get_invoices":             tool_get_invoices,
     "generate_consent_form":    tool_generate_consent_form,
 }
 
@@ -204,6 +276,11 @@ TOOL_LABELS = {
     "get_treatment_plans":      "Fetching treatment plans",
     "get_treatment_plan_items": "Fetching clinical notes",
     "get_recalls":              "Fetching recall schedule",
+    "get_sms":                  "Fetching SMS correspondence",
+    "get_patient_documents":    "Fetching uploaded documents",
+    "get_notes":                "Fetching patient notes",
+    "get_medical_histories":    "Fetching medical history",
+    "get_invoices":             "Fetching invoices",
     "generate_consent_form":    "Generating consent form",
 }
 
@@ -245,6 +322,31 @@ GEMINI_TOOLS = types.Tool(function_declarations=[
         parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
     ),
     types.FunctionDeclaration(
+        name="get_sms",
+        description="Get all SMS messages sent to or received from a patient. Contains outbound correspondence and patient replies.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_patient_documents",
+        description="Get all documents uploaded against a patient record (letters, referrals, scan reports, consent forms, etc.).",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_notes",
+        description="Get free-text clinical notes added to the patient record.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_medical_histories",
+        description="Get completed medical history forms including conditions, medications, and allergies.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_invoices",
+        description="Get invoices for a patient including treatment costs and balances.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
         name="generate_consent_form",
         description="Generate a completed dental implant consent form .docx for the patient. "
                     "Call this only after gathering all relevant patient data. "
@@ -264,11 +366,14 @@ You have direct access to the Dentally patient management system through the pro
 
 Behaviour:
 - When a patient name is mentioned, immediately search for them and then proactively gather
-  ALL available data: patient details, appointments, treatment plans, and — most importantly —
-  treatment plan items (this is where clinical notes and consultation findings are stored).
+  ALL available data: patient details, appointments, treatment plans, treatment plan items
+  (clinical notes live here), SMS correspondence, uploaded documents, free-text notes,
+  medical history forms, and invoices.
 - Answer questions using the real data you fetched, not assumptions.
-- When asked to generate a consent form, first make sure you have fetched all treatment plan
-  items, then call generate_consent_form with a rich clinical_context string.
+- If a source returns empty, note it briefly and move on — do not stop.
+- When asked to generate a consent form, first make sure you have fetched everything, then
+  call generate_consent_form with a rich clinical_context string incorporating all findings
+  including any correspondence context and medical history.
 - After generating a form, tell the user it is ready to download and offer to make any changes.
 - You can continue chatting and calling tools as needed throughout the conversation."""
 
