@@ -32,8 +32,7 @@ def _secret(key):
     except Exception:
         return os.environ.get(key, "")
 
-TOKEN      = _secret("DENTALLY_API_TOKEN")
-GEMINI_KEY = _secret("GEMINI_API_KEY")
+TOKEN = _secret("DENTALLY_API_TOKEN")
 
 HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
@@ -83,6 +82,16 @@ CONTENT_SCHEMA = """{
 }"""
 
 
+@st.cache_resource
+def _gemini():
+    return genai.Client(api_key=_secret("GEMINI_API_KEY"))
+
+
+def _gemini_call(prompt):
+    resp = _gemini().models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    return _parse_json(resp.text)
+
+
 def generate_content(patient_name, notes):
     today  = datetime.date.today().strftime("%d %B %Y")
     prompt = f"""You are a treatment coordinator at FAME Dentistry Ltd, Edinburgh.
@@ -96,9 +105,7 @@ CONSULTATION NOTES:
 
 Return ONLY valid JSON (no markdown, no code fences):
 {CONTENT_SCHEMA}"""
-    resp = genai.Client(api_key=GEMINI_KEY).models.generate_content(
-        model="gemini-2.5-flash", contents=prompt)
-    return _parse_json(resp.text)
+    return _gemini_call(prompt)
 
 
 def modify_content(patient_name, notes, current, instruction):
@@ -111,9 +118,7 @@ The clinician has requested: "{instruction}"
 
 Apply the change and return updated JSON with the same four keys (no markdown, no code fences):
 {CONTENT_SCHEMA}"""
-    resp = genai.Client(api_key=GEMINI_KEY).models.generate_content(
-        model="gemini-2.5-flash", contents=prompt)
-    return _parse_json(resp.text)
+    return _gemini_call(prompt)
 
 
 def _parse_json(text):
@@ -412,7 +417,7 @@ st.title("🦷 Consent Form Generator")
 
 _init()
 
-if not TOKEN or not GEMINI_KEY:
+if not TOKEN or not _secret("GEMINI_API_KEY"):
     st.error("API keys not configured. Add DENTALLY_API_TOKEN and GEMINI_API_KEY to Streamlit secrets.")
     st.stop()
 
