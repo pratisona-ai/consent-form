@@ -1,6 +1,8 @@
 """
-Streamlit Consent Form Generator
-Fetches Dentally consultation notes → Gemini fills template → download .docx
+Streamlit Agentic Consent Form Generator
+
+Gemini drives an agentic loop, calling Dentally API tools to gather complete
+patient data, then generates a custom-filled consent form .docx.
 """
 
 import datetime
@@ -16,15 +18,16 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from docx import Document
 from google import genai
+from google.genai import types
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-BASE_URL  = "https://api.dentally.co/v1"
-SITE_ID   = "70596be0-e19d-43a1-86e8-e209a3c1aa92"
-TEMPLATE  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "FAME Single Implant Template.docx")
+BASE_URL = "https://api.dentally.co/v1"
+SITE_ID  = "70596be0-e19d-43a1-86e8-e209a3c1aa92"
+TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "FAME Single Implant Template.docx")
 
 def _secret(key):
     try:
@@ -32,101 +35,245 @@ def _secret(key):
     except Exception:
         return os.environ.get(key, "")
 
-TOKEN = _secret("DENTALLY_API_TOKEN")
-
-HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
-    "Accept": "application/json",
-    "User-Agent": "DentallyConsentForm/1.0",
-}
-
-# ---------------------------------------------------------------------------
-# Dentally helpers
-# ---------------------------------------------------------------------------
-
-def search_patient(name):
-    r = requests.get(f"{BASE_URL}/patients", headers=HEADERS,
-                     params={"query": name}, timeout=15)
-    r.raise_for_status()
-    return r.json().get("patients", [])
-
-
-def get_consultation_items(patient_id):
-    r = requests.get(f"{BASE_URL}/treatment_plans", headers=HEADERS,
-                     params={"patient_id": patient_id, "site_id": SITE_ID}, timeout=15)
-    r.raise_for_status()
-    plans = r.json().get("treatment_plans", [])
-    items = []
-    for plan in plans:
-        r2 = requests.get(f"{BASE_URL}/treatment_plan_items", headers=HEADERS,
-                          params={"treatment_plan_id": plan["id"]}, timeout=15)
-        r2.raise_for_status()
-        for item in r2.json().get("treatment_plan_items", []):
-            if "consultation" in (item.get("nomenclature") or "").lower():
-                items.append(item)
-    return items
-
-
-def html_to_text(html):
-    return BeautifulSoup(html, "html.parser").get_text("\n").strip()
-
-# ---------------------------------------------------------------------------
-# Gemini
-# ---------------------------------------------------------------------------
-
-CONTENT_SCHEMA = """{
-  "clinical_explanation": "2-3 warm sentences in plain English — what brought the patient in and what was found. No abbreviations.",
-  "clinical_assessment": "1-2 sentences summarising clinical findings in plain English (fracture, infection, bone volume).",
-  "opt_note": "One sentence on what the OPT and CBCT scans showed.",
-  "appointment_1": "2-3 sentences: extraction of lower-right wisdom tooth (LR8), implant placement for upper-left premolar (UL4), and assessment of lower-right molar (LR6) for possible immediate implant."
-}"""
-
-
 @st.cache_resource
 def _gemini():
     return genai.Client(api_key=_secret("GEMINI_API_KEY"))
 
+def _dheaders():
+    return {
+        "Authorization": f"Bearer {_secret('DENTALLY_API_TOKEN')}",
+        "Accept": "application/json",
+        "User-Agent": "DentallyConsentForm/1.0",
+    }
 
-def _gemini_call(prompt):
-    resp = _gemini().models.generate_content(model="gemini-2.5-flash", contents=prompt)
-    return _parse_json(resp.text)
+def _dget(path, params=None):
+    r = requests.get(f"{BASE_URL}{path}", headers=_dheaders(),
+                     params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+# ---------------------------------------------------------------------------
+# Tool implementations (called by the agent)
+# ---------------------------------------------------------------------------
+
+def tool_search_patients(name: str) -> str:
+    patients = _dget("/patients", {"query": name}).get("patients", [])
+    if not patients:
+        return "No patients found."
+    return json.dumps([{
+        "id": p["id"],
+        "name": f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
+        "dob": p.get("date_of_birth"),
+        "email": p.get("email_address"),
+        "mobile": p.get("mobile_phone"),
+    } for p in patients])
 
 
-def generate_content(patient_name, notes):
+def tool_get_patient(patient_id: int) -> str:
+    p = _dget(f"/patients/{patient_id}").get("patient", {})
+    return json.dumps({
+        "id": p.get("id"),
+        "name": f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
+        "title": p.get("title"),
+        "dob": p.get("date_of_birth"),
+        "email": p.get("email_address"),
+        "mobile": p.get("mobile_phone"),
+        "address": ", ".join(filter(None, [
+            p.get("address_line_1"), p.get("address_line_2"),
+            p.get("town"), p.get("postcode"),
+        ])),
+        "occupation": p.get("occupation"),
+        "medical_alert": p.get("medical_alert"),
+        "medical_alert_text": p.get("medical_alert_text"),
+        "dentist_recall_date": p.get("dentist_recall_date"),
+        "hygienist_recall_date": p.get("hygienist_recall_date"),
+    })
+
+
+def tool_get_appointments(patient_id: int) -> str:
+    appts = _dget("/appointments", {
+        "patient_id": patient_id, "site_id": SITE_ID, "per_page": 100,
+    }).get("appointments", [])
+    if not appts:
+        return "No appointments found for this patient."
+    return json.dumps([{
+        "id": a.get("id"),
+        "start_time": a.get("start_time"),
+        "duration": a.get("duration"),
+        "reason": a.get("reason"),
+        "notes": a.get("notes"),
+        "state": a.get("state"),
+    } for a in appts])
+
+
+def tool_get_treatment_plans(patient_id: int) -> str:
+    plans = _dget("/treatment_plans", {
+        "patient_id": patient_id, "site_id": SITE_ID,
+    }).get("treatment_plans", [])
+    if not plans:
+        return "No treatment plans found."
+    return json.dumps([{
+        "id": p.get("id"),
+        "start_date": p.get("start_date"),
+        "completed": p.get("completed"),
+        "nickname": p.get("nickname"),
+        "practitioner_id": p.get("practitioner_id"),
+    } for p in plans])
+
+
+def tool_get_treatment_plan_items(treatment_plan_id: int) -> str:
+    items = _dget("/treatment_plan_items", {
+        "treatment_plan_id": treatment_plan_id,
+    }).get("treatment_plan_items", [])
+    if not items:
+        return "No items in this treatment plan."
+    results = []
+    for item in items:
+        raw = item.get("notes") or ""
+        notes = BeautifulSoup(raw, "html.parser").get_text("\n").strip() if raw else ""
+        results.append({
+            "id": item.get("id"),
+            "nomenclature": item.get("nomenclature"),
+            "teeth": item.get("teeth"),
+            "notes": notes,
+            "completed": item.get("completed"),
+            "price": item.get("price"),
+        })
+    return json.dumps(results)
+
+
+def tool_get_recalls(patient_id: int) -> str:
+    recalls = _dget("/recalls", {"patient_id": patient_id}).get("recalls", [])
+    return json.dumps(recalls) if recalls else "No recalls on record."
+
+
+def tool_generate_consent_form(patient_name: str, clinical_context: str) -> str:
+    """Fills the FAME template using Gemini and stores the .docx in session state."""
     today  = datetime.date.today().strftime("%d %B %Y")
     prompt = f"""You are a treatment coordinator at FAME Dentistry Ltd, Edinburgh.
 
-Generate patient-friendly text for four sections of a dental implant consent form.
+Using the comprehensive patient data below, write patient-friendly text for four
+sections of a dental implant consent form.
 
 PATIENT: {patient_name}  DATE: {today}  DENTIST: Dr Ferhan Ahmed
 
-CONSULTATION NOTES:
-{notes}
+PATIENT DATA:
+{clinical_context}
 
 Return ONLY valid JSON (no markdown, no code fences):
-{CONTENT_SCHEMA}"""
-    return _gemini_call(prompt)
+{{
+  "clinical_explanation": "2-3 warm sentences in plain English — what brought the patient in and what was found. No abbreviations.",
+  "clinical_assessment": "1-2 sentences on the clinical findings in plain English.",
+  "opt_note": "One sentence on what the scans/X-rays showed.",
+  "appointment_1": "2-3 sentences describing the first surgical appointment based on the treatment plan."
+}}"""
 
+    resp = _gemini().models.generate_content(model="gemini-2.5-flash", contents=prompt)
+    raw  = re.sub(r'^```(?:json)?\s*|\s*```$', '', resp.text.strip(), flags=re.MULTILINE)
+    content = json.loads(raw)
 
-def modify_content(patient_name, notes, current, instruction):
-    prompt = f"""You are a treatment coordinator at FAME Dentistry Ltd, Edinburgh.
+    address    = st.session_state.get("patient_address", "")
+    docx_bytes = _build_docx(patient_name, address, content)
 
-You previously generated this consent form content for {patient_name}:
-{json.dumps(current, indent=2)}
+    st.session_state.pending_form = {
+        "patient_name": patient_name,
+        "content": content,
+        "docx_bytes": docx_bytes,
+    }
+    return f"Consent form generated for {patient_name}. It is ready for download."
 
-The clinician has requested: "{instruction}"
-
-Apply the change and return updated JSON with the same four keys (no markdown, no code fences):
-{CONTENT_SCHEMA}"""
-    return _gemini_call(prompt)
-
-
-def _parse_json(text):
-    text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip(), flags=re.MULTILINE)
-    return json.loads(text)
 
 # ---------------------------------------------------------------------------
-# DOCX builder — copies template, replaces text in-place
+# Tool registry & Gemini declarations
+# ---------------------------------------------------------------------------
+
+TOOL_FN_MAP = {
+    "search_patients":          tool_search_patients,
+    "get_patient":              tool_get_patient,
+    "get_appointments":         tool_get_appointments,
+    "get_treatment_plans":      tool_get_treatment_plans,
+    "get_treatment_plan_items": tool_get_treatment_plan_items,
+    "get_recalls":              tool_get_recalls,
+    "generate_consent_form":    tool_generate_consent_form,
+}
+
+TOOL_LABELS = {
+    "search_patients":          "Searching patients",
+    "get_patient":              "Fetching patient details",
+    "get_appointments":         "Fetching appointments",
+    "get_treatment_plans":      "Fetching treatment plans",
+    "get_treatment_plan_items": "Fetching clinical notes",
+    "get_recalls":              "Fetching recall schedule",
+    "generate_consent_form":    "Generating consent form",
+}
+
+def _S(t, desc=None, **props):
+    return types.Schema(type=t, description=desc,
+                        properties=props or None,
+                        required=list(props) if props else None)
+
+GEMINI_TOOLS = types.Tool(function_declarations=[
+    types.FunctionDeclaration(
+        name="search_patients",
+        description="Search Dentally for patients by name. Returns IDs needed for all other calls.",
+        parameters=_S(types.Type.OBJECT, name=_S(types.Type.STRING, "Patient full or partial name")),
+    ),
+    types.FunctionDeclaration(
+        name="get_patient",
+        description="Get full demographics and medical details for a patient ID.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_appointments",
+        description="Get all appointments for a patient including reasons and clinical notes.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_treatment_plans",
+        description="Get all treatment plans for a patient. Returns plan IDs required for get_treatment_plan_items.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_treatment_plan_items",
+        description="Get all items and full clinical notes within a treatment plan. "
+                    "This is where consultation notes, diagnoses, and planned procedures live.",
+        parameters=_S(types.Type.OBJECT, treatment_plan_id=_S(types.Type.INTEGER, "Treatment plan ID")),
+    ),
+    types.FunctionDeclaration(
+        name="get_recalls",
+        description="Get the recall schedule for a patient.",
+        parameters=_S(types.Type.OBJECT, patient_id=_S(types.Type.INTEGER, "Dentally patient ID")),
+    ),
+    types.FunctionDeclaration(
+        name="generate_consent_form",
+        description="Generate a completed dental implant consent form .docx for the patient. "
+                    "Call this only after gathering all relevant patient data. "
+                    "Provide a rich clinical_context string covering all findings.",
+        parameters=_S(
+            types.Type.OBJECT,
+            patient_name=_S(types.Type.STRING, "Patient full name"),
+            clinical_context=_S(types.Type.STRING,
+                "Comprehensive summary of all gathered data: demographics, clinical notes, "
+                "diagnoses, X-ray findings, treatment planned, teeth involved, next steps"),
+        ),
+    ),
+])
+
+SYSTEM_PROMPT = """You are a dental treatment coordinator assistant at FAME Dentistry Ltd, Edinburgh.
+You have direct access to the Dentally patient management system through the provided tools.
+
+Behaviour:
+- When a patient name is mentioned, immediately search for them and then proactively gather
+  ALL available data: patient details, appointments, treatment plans, and — most importantly —
+  treatment plan items (this is where clinical notes and consultation findings are stored).
+- Answer questions using the real data you fetched, not assumptions.
+- When asked to generate a consent form, first make sure you have fetched all treatment plan
+  items, then call generate_consent_form with a rich clinical_context string.
+- After generating a form, tell the user it is ready to download and offer to make any changes.
+- You can continue chatting and calling tools as needed throughout the conversation."""
+
+# ---------------------------------------------------------------------------
+# DOCX builder
 # ---------------------------------------------------------------------------
 
 def _replace_in_para(para, old, new, exact=False):
@@ -147,7 +294,7 @@ def _replace_in_para(para, old, new, exact=False):
     return True
 
 
-def _apply_replacements(doc, sub_map, exact_map):
+def _apply(doc, sub_map, exact_map):
     def process(para):
         for old, new in exact_map.items():
             if _replace_in_para(para, old, new, exact=True):
@@ -172,24 +319,23 @@ def _apply_replacements(doc, sub_map, exact_map):
                 pass
 
 
-def build_docx_bytes(patient_name, address, content):
+def _build_docx(patient_name, address, content):
     today = datetime.date.today().strftime("%d %B %Y")
 
     exact_map = {
         "Date":            today,
         "Patient Name":    patient_name,
         "Patient Address": address or "",
-        "Patient friendly explanation of clinical notes.":      content["clinical_explanation"],
-        "Clinical assessment explained in patient friendly words.": content["clinical_assessment"],
-        "OPT with area marked for patient reference.":          content["opt_note"],
-        "Appointment explained.":                               content["appointment_1"],
+        "Patient friendly explanation of clinical notes.":          content["clinical_explanation"],
+        "Clinical assessment explained in patient friendly words.":  content["clinical_assessment"],
+        "OPT with area marked for patient reference.":              content["opt_note"],
+        "Appointment explained.":                                   content["appointment_1"],
     }
-
     sub_map = dict(sorted({
         "Dental Implant Treatment Proposal for:  ":
             f"Dental Implant Treatment Proposal for: {patient_name}",
-        "Prepared by: Dentist Name": "Prepared by: Dr Ferhan Ahmed",
-        "Dear Patient Name,":        f"Dear {patient_name},",
+        "Prepared by: Dentist Name":   "Prepared by: Dr Ferhan Ahmed",
+        "Dear Patient Name,":          f"Dear {patient_name},",
         "I, Patient name, hereby consent":
             f"I, {patient_name}, hereby consent",
         "explained the Treatment Plan to patient name and given her/him":
@@ -206,10 +352,9 @@ def build_docx_bytes(patient_name, address, content):
     with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
         shutil.copy2(TEMPLATE, tmp.name)
         tmp_path = tmp.name
-
     try:
         doc = Document(tmp_path)
-        _apply_replacements(doc, sub_map, exact_map)
+        _apply(doc, sub_map, exact_map)
         buf = io.BytesIO()
         doc.save(buf)
         return buf.getvalue()
@@ -217,7 +362,7 @@ def build_docx_bytes(patient_name, address, content):
         os.unlink(tmp_path)
 
 
-def docx_to_text(docx_bytes):
+def _docx_to_text(docx_bytes):
     doc = Document(io.BytesIO(docx_bytes))
     return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
@@ -227,12 +372,10 @@ def docx_to_text(docx_bytes):
 
 def render_form_card(patient_name, content, docx_bytes, key):
     today = datetime.date.today().strftime("%d %B %Y")
-
     st.markdown(f"""
 **Patient:** {patient_name} &nbsp;|&nbsp; **Date:** {today} &nbsp;|&nbsp; **Dentist:** Dr Ferhan Ahmed
 
 ---
-
 **Your situation**
 {content["clinical_explanation"]}
 
@@ -246,167 +389,136 @@ def render_form_card(patient_name, content, docx_bytes, key):
 {content["appointment_1"]}
 
 ---
-*Full document includes appointments 2–7, complications, consent & payment sections.*
+*Full document includes appointments 2–7, complications list, consent & payment sections.*
 """)
-
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
-            label="⬇️ Download .docx",
-            data=docx_bytes,
+            "⬇️ Download .docx", data=docx_bytes,
             file_name=f"{patient_name} - Implant Consent Form.docx",
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            key=f"dl_{key}",
+            use_container_width=True, key=f"dl_{key}",
         )
     with col2:
         with st.expander("📋 Copy full text"):
-            st.text_area(
-                label="full_text",
-                value=docx_to_text(docx_bytes),
-                height=260,
-                label_visibility="collapsed",
-                key=f"txt_{key}",
-            )
+            st.text_area("", value=_docx_to_text(docx_bytes), height=260,
+                         label_visibility="collapsed", key=f"txt_{key}")
 
 # ---------------------------------------------------------------------------
-# Session state
+# Agentic loop
+# ---------------------------------------------------------------------------
+
+def _run_agent(user_message):
+    st.session_state.gemini_history.append(
+        types.Content(role="user", parts=[types.Part(text=user_message)])
+    )
+
+    response_text = ""
+    calls_log     = []
+
+    with st.chat_message("assistant"):
+        status_box  = st.empty()
+        text_box    = st.empty()
+
+        for _ in range(20):  # hard cap on iterations
+            try:
+                resp = _gemini().models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=st.session_state.gemini_history,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        tools=[GEMINI_TOOLS],
+                    ),
+                )
+            except Exception as e:
+                status_box.error(f"Gemini error: {e}")
+                return
+
+            candidate = resp.candidates[0]
+            parts     = candidate.content.parts
+            fn_calls  = [p for p in parts if p.function_call]
+
+            if not fn_calls:
+                # Terminal text response
+                response_text = "".join(p.text for p in parts if hasattr(p, "text") and p.text)
+                status_box.empty()
+                text_box.markdown(response_text)
+                st.session_state.gemini_history.append(candidate.content)
+                break
+
+            # Show live status
+            names = [p.function_call.name for p in fn_calls]
+            label = " · ".join(TOOL_LABELS.get(n, n) for n in names)
+            status_box.info(f"🔍 {label}…")
+            calls_log.extend(names)
+
+            # Add model turn to history
+            st.session_state.gemini_history.append(candidate.content)
+
+            # Execute each tool call and collect responses
+            tool_parts = []
+            for p in fn_calls:
+                fc   = p.function_call
+                args = {k: v for k, v in fc.args.items()}
+                try:
+                    result = TOOL_FN_MAP[fc.name](**args)
+                except Exception as e:
+                    result = f"Error calling {fc.name}: {e}"
+                tool_parts.append(types.Part(
+                    function_response=types.FunctionResponse(
+                        name=fc.name, response={"result": result}
+                    )
+                ))
+
+            # Function responses go back as a "user" turn
+            st.session_state.gemini_history.append(
+                types.Content(role="user", parts=tool_parts)
+            )
+
+        # Show collapsed log of API calls made
+        if calls_log:
+            with st.expander(f"🔧 {len(calls_log)} Dentally API calls", expanded=False):
+                for c in calls_log:
+                    st.caption(f"• {TOOL_LABELS.get(c, c)}")
+
+        # Render form card if the agent generated one
+        pending = st.session_state.pop("pending_form", None)
+        if pending:
+            st.session_state.form_version += 1
+            render_form_card(
+                pending["patient_name"], pending["content"],
+                pending["docx_bytes"], key=st.session_state.form_version,
+            )
+            st.session_state.messages.append({
+                "role": "assistant", "text": response_text,
+                "type": "form",
+                "patient_name": pending["patient_name"],
+                "content":      pending["content"],
+                "docx_bytes":   pending["docx_bytes"],
+                "form_key":     st.session_state.form_version,
+                "calls_log":    calls_log,
+            })
+        else:
+            st.session_state.messages.append({
+                "role": "assistant", "text": response_text,
+                "calls_log": calls_log,
+            })
+
+# ---------------------------------------------------------------------------
+# Session state init
 # ---------------------------------------------------------------------------
 
 def _init():
     defaults = dict(
-        messages=[],   # list of dicts: {role, text, type?, patient_name?, content?, docx_bytes?}
-        stage="init",  # "init" | "form_ready"
-        patient=None,
-        notes_text=None,
-        content=None,
-        docx_bytes=None,
-        form_version=0,  # increments on each regeneration for unique widget keys
+        messages=[],
+        gemini_history=[],   # list of types.Content — persists full conversation
+        patient_address="",
+        pending_form=None,
+        form_version=0,
     )
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
-
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
-
-def _handle_patient(patient_name):
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner(f"Searching for {patient_name}…"):
-                patients = search_patient(patient_name)
-        except Exception as e:
-            st.error(f"Dentally error: {e}")
-            st.session_state.messages.append({"role": "assistant", "text": f"Error: {e}"})
-            return
-
-        if not patients:
-            msg = f"No patient found matching **{patient_name}**. Please check the name and try again."
-            st.markdown(msg)
-            st.session_state.messages.append({"role": "assistant", "text": msg})
-            return
-
-        patient   = patients[0]
-        full_name = f"{patient['first_name']} {patient['last_name']}"
-        address   = ", ".join(filter(None, [
-            patient.get("address_line_1"), patient.get("address_line_2"),
-            patient.get("town"), patient.get("postcode"),
-        ]))
-        st.session_state.patient = patient
-
-        st.markdown(f"Found **{full_name}**. Fetching consultation notes…")
-
-        try:
-            with st.spinner("Fetching notes from Dentally…"):
-                items = get_consultation_items(patient["id"])
-        except Exception as e:
-            st.error(f"Dentally error: {e}")
-            st.session_state.messages.append({"role": "assistant", "text": f"Error: {e}"})
-            return
-
-        if not items:
-            msg = f"No consultation notes found for **{full_name}**."
-            st.markdown(msg)
-            st.session_state.messages.append({"role": "assistant", "text": msg})
-            return
-
-        notes_text = "\n\n".join(
-            f"[{i['nomenclature']}]\n{html_to_text(i.get('notes') or '')}"
-            for i in items
-        )
-        st.session_state.notes_text = notes_text
-
-        st.markdown("Generating consent form with Gemini…")
-
-        try:
-            with st.spinner("Generating patient-friendly content…"):
-                content = generate_content(full_name, notes_text)
-            with st.spinner("Building document…"):
-                docx_bytes = build_docx_bytes(full_name, address, content)
-        except Exception as e:
-            st.error(f"Generation error: {e}")
-            st.session_state.messages.append({"role": "assistant", "text": f"Error: {e}"})
-            return
-
-        st.session_state.content    = content
-        st.session_state.docx_bytes = docx_bytes
-        st.session_state.stage      = "form_ready"
-        st.session_state.form_version += 1
-
-        st.markdown("Here's the generated consent form:")
-        render_form_card(full_name, content, docx_bytes,
-                         key=st.session_state.form_version)
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "text": f"Found **{full_name}**. Here's the generated consent form:",
-            "type": "form",
-            "patient_name": full_name,
-            "content": content,
-            "docx_bytes": docx_bytes,
-            "form_key": st.session_state.form_version,
-        })
-
-
-def _handle_modification(instruction):
-    patient   = st.session_state.patient
-    full_name = f"{patient['first_name']} {patient['last_name']}"
-    address   = ", ".join(filter(None, [
-        patient.get("address_line_1"), patient.get("address_line_2"),
-        patient.get("town"), patient.get("postcode"),
-    ]))
-
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner("Updating consent form…"):
-                new_content = modify_content(
-                    full_name, st.session_state.notes_text,
-                    st.session_state.content, instruction,
-                )
-                docx_bytes = build_docx_bytes(full_name, address, new_content)
-        except Exception as e:
-            st.error(f"Error: {e}")
-            st.session_state.messages.append({"role": "assistant", "text": f"Error: {e}"})
-            return
-
-        st.session_state.content    = new_content
-        st.session_state.docx_bytes = docx_bytes
-        st.session_state.form_version += 1
-
-        st.markdown("Done — here's the updated consent form:")
-        render_form_card(full_name, new_content, docx_bytes,
-                         key=st.session_state.form_version)
-
-        st.session_state.messages.append({
-            "role": "assistant",
-            "text": "Done — here's the updated consent form:",
-            "type": "form",
-            "patient_name": full_name,
-            "content": new_content,
-            "docx_bytes": docx_bytes,
-            "form_key": st.session_state.form_version,
-        })
 
 # ---------------------------------------------------------------------------
 # App
@@ -417,21 +529,25 @@ st.title("🦷 Consent Form Generator")
 
 _init()
 
-if not TOKEN or not _secret("GEMINI_API_KEY"):
-    st.error("API keys not configured. Add DENTALLY_API_TOKEN and GEMINI_API_KEY to Streamlit secrets.")
+if not _secret("DENTALLY_API_TOKEN") or not _secret("GEMINI_API_KEY"):
+    st.error("Add DENTALLY_API_TOKEN and GEMINI_API_KEY to Streamlit secrets.")
     st.stop()
 
-# Render existing chat history
+# Re-render chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["text"])
+        if msg.get("calls_log"):
+            with st.expander(f"🔧 {len(msg['calls_log'])} Dentally API calls", expanded=False):
+                for c in msg["calls_log"]:
+                    st.caption(f"• {TOOL_LABELS.get(c, c)}")
         if msg.get("type") == "form":
             render_form_card(
                 msg["patient_name"], msg["content"], msg["docx_bytes"],
                 key=f"hist_{msg['form_key']}",
             )
 
-# Greeting on first load
+# Greeting
 if not st.session_state.messages:
     with st.chat_message("assistant"):
         st.markdown("Hi! Which patient would you like to generate a consent form for?")
@@ -445,8 +561,4 @@ if prompt := st.chat_input("Type a message…"):
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "text": prompt})
-
-    if st.session_state.stage == "init":
-        _handle_patient(prompt)
-    else:
-        _handle_modification(prompt)
+    _run_agent(prompt)
